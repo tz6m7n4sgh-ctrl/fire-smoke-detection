@@ -1,358 +1,453 @@
-import cv2
+"""AgroSentinel — real-time fire/smoke detection + plant disease classification.
+
+Production-grade edge inference pipeline:
+  * Two model workers (fire detection, plant classification) run on background
+    threads, consuming the latest camera frame.
+  * Confirmed detections are pushed to a bounded queue and uploaded to Firebase
+    by a dedicated uploader pool that DRAINS on shutdown (no dropped events).
+  * Workers are supervised: an unhandled exception restarts the worker instead
+    of silently freezing detections.
+  * Graceful shutdown on Q / Ctrl+C / camera loss — threads are joined.
+
+Configuration is centralized in the Config dataclass and overridable via
+environment variables (AGRO_*), so the same binary runs in dev and on device.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
 import time
+import queue
+import signal
+import logging
 import threading
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
+
+import cv2
+import numpy as np
 from ultralytics import YOLO
 
 from detect_and_upload import handle_detection, handle_disease_classification
 
-# ── Paths ──────────────────────────────────────────────────────────
-SCRIPT_DIR  = Path(__file__).parent
 
-# Fix #1: MODEL_FIRE now auto-discovers the latest phase2 run from train_fire.py output,
-# falling back to models/fire_best.pt if no training run exists yet.
-def _find_fire_model():
+# ─────────────────────────────────────────────────────────────────
+# LOGGING
+# ─────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=os.getenv("AGRO_LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("agrosentinel")
+
+
+# ─────────────────────────────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────────────────────────────
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+
+def _env_float(key: str, default: float) -> float:
+    try:
+        return float(os.environ[key])
+    except (KeyError, ValueError):
+        return default
+
+
+def _env_int(key: str, default: int) -> int:
+    try:
+        return int(os.environ[key])
+    except (KeyError, ValueError):
+        return default
+
+
+def _env_opt_float(key: str) -> Optional[float]:
+    """Optional float env var — returns None if unset/invalid (for GPS)."""
+    try:
+        return float(os.environ[key])
+    except (KeyError, ValueError):
+        return None
+
+
+def _find_fire_model() -> Path:
+    """Locate the newest trained fire model from train_fire.py output.
+
+    Fix #1 / cross-file: glob ``*_phase2*`` (not ``*_phase2``) so Ultralytics
+    auto-incremented run dirs (``..._phase22``) are matched.
+    Fix #6: broken symlinks / unreadable files are skipped, not fatal.
+    """
     runs_dir = SCRIPT_DIR / "training_runs"
+    candidates: list[tuple[float, Path]] = []
     if runs_dir.exists():
-        candidates = sorted(runs_dir.glob("*_phase2/weights/best.pt"),
-                            key=lambda p: p.stat().st_mtime, reverse=True)
-        if candidates:
-            print(f"[fire] Auto-detected model: {candidates[0]}")
-            return candidates[0]
+        for p in runs_dir.glob("*_phase2*/weights/best.pt"):
+            try:
+                candidates.append((p.stat().st_mtime, p))
+            except OSError as exc:                       # broken symlink / perms
+                log.warning("Skipping unreadable model %s: %s", p, exc)
+    if candidates:
+        newest = max(candidates, key=lambda t: t[0])[1]
+        log.info("Auto-detected fire model: %s", newest)
+        return newest
     fallback = SCRIPT_DIR / "models" / "fire_best.pt"
+    log.info("No trained run found — falling back to %s", fallback)
     return fallback
 
-MODEL_FIRE  = _find_fire_model()
-MODEL_PLANT = SCRIPT_DIR / "models" / "plant_best.pt"
 
-# ── Upload thresholds ──────────────────────────────────────────────
-CONF_UPLOAD   = 0.80
-CONFIRM_SECS  = 2.0
-SAVE_COOLDOWN = 30.0
+@dataclass
+class Config:
+    # Models
+    model_fire: Path = field(default_factory=_find_fire_model)
+    model_plant: Path = field(default_factory=lambda: SCRIPT_DIR / "models" / "plant_best.pt")
 
-# ── Fire model (object detection, 640px) ──────────────────────────
-FIRE_CONF_DISPLAY  = 0.35
-FIRE_IMGSZ         = 640
-FIRE_IGNORE        = {"default"}
-FIRE_MAX_AREA      = 0.65   # reject boxes covering > 65% of frame (background walls)
-FIRE_LEFT_MARGIN   = 8      # reject boxes starting at left edge (wall bleed-in)
-FIRE_STICKY_FRAMES = 6      # keep showing last box for N frames after detection lost
+    # Upload / confirmation
+    conf_upload: float = _env_float("AGRO_CONF_UPLOAD", 0.80)
+    confirm_secs: float = _env_float("AGRO_CONFIRM_SECS", 2.0)
+    save_cooldown: float = _env_float("AGRO_SAVE_COOLDOWN", 30.0)
 
-# ── Plant model (classification, 256px) ───────────────────────────
-PLANT_CONF_DISPLAY = 0.60
-PLANT_IMGSZ        = 256
-PLANT_GREEN_THRESH = 0.08
+    # Fire model (object detection). imgsz matches training default (1280) for
+    # best small/distant-fire recall; override with AGRO_FIRE_IMGSZ on weak HW.
+    fire_conf_display: float = _env_float("AGRO_FIRE_CONF", 0.35)
+    fire_imgsz: int = _env_int("AGRO_FIRE_IMGSZ", 1280)
+    fire_max_area: float = 0.65        # reject boxes > 65% of frame (walls)
+    fire_left_margin: int = 8          # reject boxes hugging the left edge
+    fire_sticky_frames: int = 6        # keep last box visible N frames
 
-# ── GPS — Fix #2: replace hardcoded placeholders with configurable values ──
-# Set these to your actual location or hook up a real GPS module.
-GPS_LAT = None   # e.g. 32.0853 — set before running
-GPS_LNG = None   # e.g. 34.7818
+    # Plant model (classification)
+    plant_conf_display: float = 0.60
+    plant_imgsz: int = _env_int("AGRO_PLANT_IMGSZ", 256)
+    plant_green_thresh: float = 0.08
 
-def _gps():
-    if GPS_LAT is None or GPS_LNG is None:
-        print("[WARNING] GPS_LAT / GPS_LNG not set — uploads will use 0.0, 0.0")
-        return 0.0, 0.0
-    return GPS_LAT, GPS_LNG
+    # GPS — required for meaningful uploads
+    gps_lat: Optional[float] = field(default_factory=lambda: _env_opt_float("AGRO_GPS_LAT"))
+    gps_lng: Optional[float] = field(default_factory=lambda: _env_opt_float("AGRO_GPS_LNG"))
 
-# ── Shared: raw camera frame ──────────────────────────────────────
-_raw_frame    = None
-_raw_frame_id = 0
-_raw_lock     = threading.Lock()
+    # Runtime
+    camera_index: int = _env_int("AGRO_CAMERA", 0)
+    upload_queue_max: int = 64
+    upload_workers: int = 2
+    worker_restart_max: int = 5        # give up after N crashes per worker
 
-# Fix #5: camera-ready event so workers don't busy-loop before first frame
-_camera_ready = threading.Event()
+    fire_ignore: frozenset[str] = frozenset({"default"})
 
-# ── Shared: annotation data (workers write, main draws) ───────────
-_fire_boxes  = []      # list of [x1, y1, x2, y2, label, conf]
-_fire_alock  = threading.Lock()
+    def gps(self) -> tuple[float, float]:
+        if self.gps_lat is None or self.gps_lng is None:
+            log.warning("GPS not set — uploading with 0.0, 0.0")
+            return 0.0, 0.0
+        return self.gps_lat, self.gps_lng
 
-# [0] = (label, conf, veg_bbox) or None
-_plant_state = [None]
-_plant_alock = threading.Lock()
 
-_stop = threading.Event()
+CFG = Config()
 
 
 # ─────────────────────────────────────────────────────────────────
-# FIREBASE UPLOAD
+# SHARED STATE
 # ─────────────────────────────────────────────────────────────────
-def upload_to_firebase(model_name, label, confidence, frame, bbox):
-    lat, lng = _gps()
+class FrameBus:
+    """Single-slot latest-frame buffer shared between camera and workers."""
+
+    def __init__(self) -> None:
+        self._frame: Optional[np.ndarray] = None
+        self._id = 0
+        self._lock = threading.Lock()
+        self.ready = threading.Event()
+
+    def publish(self, frame: np.ndarray) -> None:
+        with self._lock:
+            self._frame = frame
+            self._id += 1
+
+    def latest(self) -> tuple[int, Optional[np.ndarray]]:
+        with self._lock:
+            return self._id, (self._frame.copy() if self._frame is not None else None)
+
+
+BUS = FrameBus()
+STOP = threading.Event()
+
+_fire_boxes: list = []
+_fire_lock = threading.Lock()
+_plant_state: list = [None]   # [0] = (label, conf, veg_bbox) or None
+_plant_lock = threading.Lock()
+
+
+# ─────────────────────────────────────────────────────────────────
+# UPLOAD QUEUE — drains on shutdown so in-flight events aren't lost
+# ─────────────────────────────────────────────────────────────────
+@dataclass
+class UploadJob:
+    model_name: str
+    label: str
+    confidence: float
+    frame: np.ndarray
+    bbox: Optional[list]
+
+
+_upload_q: "queue.Queue[Optional[UploadJob]]" = queue.Queue(maxsize=CFG.upload_queue_max)
+
+
+def _do_upload(job: UploadJob) -> None:
+    lat, lng = CFG.gps()
     try:
-        if model_name == "fire":
+        if job.model_name == "fire":
             handle_detection(
-                frame=frame,
-                bbox=bbox,
-                anomaly_type="fire",
-                confidence=confidence,
-                gps_lat=lat,
-                gps_lng=lng,
-                label=label,
+                frame=job.frame, bbox=job.bbox, anomaly_type="fire",
+                confidence=job.confidence, gps_lat=lat, gps_lng=lng, label=job.label,
             )
-            print(f"[Firebase] fire uploaded: {label} {confidence:.0%}")
-        elif model_name == "plant":
+        elif job.model_name == "plant":
             handle_disease_classification(
-                frame=frame,
-                disease_name=label,
-                confidence=confidence,
-                gps_lat=lat,
-                gps_lng=lng,
-                bbox=None,
+                frame=job.frame, disease_name=job.label, confidence=job.confidence,
+                gps_lat=lat, gps_lng=lng, bbox=None,
             )
-            print(f"[Firebase] plant uploaded: {label} {confidence:.0%}")
-    except Exception as exc:
-        print(f"[Firebase ERROR] {model_name}: {exc}")
+        log.info("[firebase] %s uploaded: %s %.0f%%",
+                 job.model_name, job.label, job.confidence * 100)
+    except Exception:
+        log.exception("[firebase] upload failed for %s/%s", job.model_name, job.label)
+
+
+def _uploader_loop() -> None:
+    while True:
+        job = _upload_q.get()
+        try:
+            if job is None:          # poison pill — shutdown
+                return
+            _do_upload(job)
+        finally:
+            _upload_q.task_done()
+
+
+def enqueue_upload(model_name: str, label: str, conf: float,
+                   frame: np.ndarray, bbox: Optional[list]) -> bool:
+    """Queue an upload. Returns False if the queue is full (event dropped)."""
+    try:
+        _upload_q.put_nowait(UploadJob(model_name, label, conf, frame, bbox))
+        return True
+    except queue.Full:
+        log.warning("[firebase] queue full — dropped %s/%s", model_name, label)
+        return False
 
 
 # ─────────────────────────────────────────────────────────────────
 # FIRE WORKER
 # ─────────────────────────────────────────────────────────────────
-def _fire_worker():
-    print("[fire] Loading model...")
-    model = YOLO(str(MODEL_FIRE))
-    print(f"[fire] Ready. Classes: {list(model.names.values())}")
+def _fire_worker() -> None:
+    log.info("[fire] loading model %s", CFG.model_fire)
+    model = YOLO(str(CFG.model_fire))
+    log.info("[fire] ready. classes: %s", list(model.names.values()))
 
-    # Fix #5: wait for camera before entering the detection loop
-    _camera_ready.wait()
+    BUS.ready.wait()
 
-    last_seen_id    = -1
-    first_detected  = None
-    first_label     = None   # Fix #3: track which label started the timer
-    last_uploaded   = {}     # Fix #4: per-label cooldown dict
-    missed_frames   = 0
-    last_best_box   = None
+    last_seen_id = -1
+    first_detected: Optional[float] = None
+    first_label: Optional[str] = None
+    last_uploaded: dict[str, float] = {}
+    missed_frames = 0
+    last_best_box = None
 
-    while not _stop.is_set():
-        with _raw_lock:
-            fid   = _raw_frame_id
-            frame = _raw_frame.copy() if _raw_frame is not None else None
-
+    while not STOP.is_set():
+        fid, frame = BUS.latest()
         if frame is None or fid == last_seen_id:
             time.sleep(0.005)
             continue
         last_seen_id = fid
 
-        fh, fw     = frame.shape[:2]
-        frame_area = fw * fh
+        fh, fw = frame.shape[:2]
+        frame_area = float(fw * fh)
 
-        results = model(frame, conf=FIRE_CONF_DISPLAY, imgsz=FIRE_IMGSZ, verbose=False)
-        result  = results[0]
+        results = model(frame, conf=CFG.fire_conf_display,
+                        imgsz=CFG.fire_imgsz, verbose=False)
+        result = results[0]
 
         valid = []
         for box in result.boxes:
             cls_id = int(box.cls[0])
-            label  = result.names[cls_id]
-            if label.lower() in FIRE_IGNORE:
+            label = result.names.get(cls_id, str(cls_id))   # Fix #6: no KeyError
+            if label.lower() in CFG.fire_ignore:
                 continue
             x1, y1, x2, y2 = map(int, box.xyxy[0])
             conf = float(box.conf[0])
-            if (x2 - x1) * (y2 - y1) / frame_area > FIRE_MAX_AREA:
+            if (x2 - x1) * (y2 - y1) / frame_area > CFG.fire_max_area:
                 continue
-            if x1 <= FIRE_LEFT_MARGIN:
+            if x1 <= CFG.fire_left_margin:
                 continue
             valid.append([x1, y1, x2, y2, label, conf])
 
         if valid:
-            best_box      = max(valid, key=lambda b: b[5])
+            best_box = max(valid, key=lambda b: b[5])
             last_best_box = best_box
             missed_frames = 0
-            boxes_data    = [best_box]
+            boxes_data = [best_box]
         else:
             missed_frames += 1
-            if missed_frames <= FIRE_STICKY_FRAMES and last_best_box is not None:
+            if missed_frames <= CFG.fire_sticky_frames and last_best_box is not None:
                 boxes_data = [last_best_box]
             else:
-                boxes_data    = []
+                boxes_data = []
                 last_best_box = None
 
-        with _fire_alock:
+        with _fire_lock:
             _fire_boxes.clear()
             _fire_boxes.extend(boxes_data)
 
         now = time.time()
 
-        if not valid and missed_frames > FIRE_STICKY_FRAMES:
+        if not valid and missed_frames > CFG.fire_sticky_frames:
             if first_detected is not None:
-                print("[fire] Lost — timer reset")
-            first_detected = None
-            first_label    = None
+                log.debug("[fire] lost — timer reset")
+            first_detected = first_label = None
             continue
-
         if not valid:
             continue
 
-        best = max(valid, key=lambda b: b[5])
-        x1, y1, x2, y2, best_label, best_conf = best
+        x1, y1, x2, y2, best_label, best_conf = max(valid, key=lambda b: b[5])
         bbox = [x1, y1, x2, y2]
 
-        # Fix #3: reset timer if the dominant label changed mid-confirmation
         if first_label is not None and best_label != first_label:
-            print(f"[fire] Label changed {first_label} → {best_label} — timer reset")
-            first_detected = None
-            first_label    = None
+            log.debug("[fire] label changed %s -> %s — timer reset", first_label, best_label)
+            first_detected = first_label = None
 
         if first_detected is None:
             first_detected = now
-            first_label    = best_label
-            print(f"[fire] Detected {best_label} {best_conf:.0%} — confirming...")
+            first_label = best_label
+            log.info("[fire] detected %s %.0f%% — confirming", best_label, best_conf * 100)
 
-        if best_conf < CONF_UPLOAD:
-            elapsed = now - first_detected
-            print(f"[fire] Confirming... {elapsed:.1f}s / {CONFIRM_SECS}s (conf {best_conf:.0%})")
+        if best_conf < CFG.conf_upload:
             continue
 
-        elapsed          = now - first_detected
-        label_last_saved = last_uploaded.get(best_label, 0.0)  # Fix #4: per-label cooldown
-
-        if elapsed >= CONFIRM_SECS and (now - label_last_saved) >= SAVE_COOLDOWN:
-            print(f"[fire] Confirmed {elapsed:.1f}s — uploading...")
-            threading.Thread(
-                target=upload_to_firebase,
-                args=("fire", best_label, best_conf, frame, bbox),
-                daemon=True,
-            ).start()
+        elapsed = now - first_detected
+        cooled = now - last_uploaded.get(best_label, 0.0)
+        if elapsed >= CFG.confirm_secs and cooled >= CFG.save_cooldown:
+            log.info("[fire] confirmed %.1fs — queueing upload", elapsed)
+            enqueue_upload("fire", best_label, best_conf, frame, bbox)
             last_uploaded[best_label] = now
-            first_detected = None
-            first_label    = None
-        elif elapsed < CONFIRM_SECS:
-            print(f"[fire] Confirming... {elapsed:.1f}s / {CONFIRM_SECS}s")
-        else:
-            remaining = SAVE_COOLDOWN - (now - label_last_saved)
-            print(f"[fire] Confirmed but cooling down — {remaining:.0f}s remaining")
+            first_detected = first_label = None
+        elif elapsed >= CFG.confirm_secs:
+            log.debug("[fire] confirmed but cooling down — %.0fs left",
+                      CFG.save_cooldown - cooled)
 
 
 # ─────────────────────────────────────────────────────────────────
 # PLANT WORKER
 # ─────────────────────────────────────────────────────────────────
-def _plant_worker():
-    print("[plant] Loading model...")
-    model = YOLO(str(MODEL_PLANT))
-    print(f"[plant] Ready. Classes: {list(model.names.values())}")
+def _plant_worker() -> None:
+    log.info("[plant] loading model %s", CFG.model_plant)
+    model = YOLO(str(CFG.model_plant))
+    log.info("[plant] ready. classes: %s", list(model.names.values()))
 
-    # Fix #5: wait for camera before entering the detection loop
-    _camera_ready.wait()
+    BUS.ready.wait()
 
-    last_seen_id   = -1
-    first_detected = None
-    first_label    = None   # Fix #3
-    last_uploaded  = {}     # Fix #4: per-label cooldown dict
+    last_seen_id = -1
+    first_detected: Optional[float] = None
+    first_label: Optional[str] = None
+    last_uploaded: dict[str, float] = {}
 
-    while not _stop.is_set():
-        with _raw_lock:
-            fid   = _raw_frame_id
-            frame = _raw_frame.copy() if _raw_frame is not None else None
-
+    while not STOP.is_set():
+        fid, frame = BUS.latest()
         if frame is None or fid == last_seen_id:
             time.sleep(0.005)
             continue
         last_seen_id = fid
 
-        hsv         = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        green_mask  = cv2.inRange(hsv, (35, 40, 40), (85, 255, 255))
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        green_mask = cv2.inRange(hsv, (35, 40, 40), (85, 255, 255))
         green_ratio = float(green_mask.sum()) / 255.0 / (frame.shape[0] * frame.shape[1])
 
-        if green_ratio < PLANT_GREEN_THRESH:
-            with _plant_alock:
+        if green_ratio < CFG.plant_green_thresh:
+            with _plant_lock:
                 _plant_state[0] = None
-            if first_detected is not None:
-                print("[plant] Not green enough — timer reset")
-            first_detected = None
-            first_label    = None
+            first_detected = first_label = None
             continue
 
         contours, _ = cv2.findContours(green_mask, cv2.RETR_EXTERNAL,
                                        cv2.CHAIN_APPROX_SIMPLE)
         veg_bbox = None
         if contours:
-            largest        = max(contours, key=cv2.contourArea)
-            gx, gy, gw, gh = cv2.boundingRect(largest)
-            veg_bbox       = (gx, gy, gx + gw, gy + gh)
+            gx, gy, gw, gh = cv2.boundingRect(max(contours, key=cv2.contourArea))
+            veg_bbox = (gx, gy, gx + gw, gy + gh)
 
-        results = model(frame, imgsz=PLANT_IMGSZ, verbose=False)
-        result  = results[0]
-
+        result = model(frame, imgsz=CFG.plant_imgsz, verbose=False)[0]
         if result.probs is None:
             continue
 
-        top1_idx  = int(result.probs.top1)
+        top1_idx = int(result.probs.top1)
         top1_conf = float(result.probs.top1conf)
-        label     = result.names[top1_idx]
+        label = result.names.get(top1_idx, str(top1_idx))   # Fix #6: no KeyError
 
         now = time.time()
 
-        if top1_conf < PLANT_CONF_DISPLAY:
-            with _plant_alock:
+        if top1_conf < CFG.plant_conf_display:
+            with _plant_lock:
                 _plant_state[0] = None
-            if first_detected is not None:
-                print("[plant] Low conf — timer reset")
-            first_detected = None
-            first_label    = None
+            first_detected = first_label = None
             continue
 
-        with _plant_alock:
+        with _plant_lock:
             _plant_state[0] = (label, top1_conf, veg_bbox)
 
-        # Fix #3: reset timer if label changed mid-confirmation
         if first_label is not None and label != first_label:
-            print(f"[plant] Label changed {first_label} → {label} — timer reset")
-            first_detected = None
-            first_label    = None
+            first_detected = first_label = None
 
         if first_detected is None:
             first_detected = now
-            first_label    = label
-            print(f"[plant] Detected {label} {top1_conf:.0%} — confirming...")
+            first_label = label
+            log.info("[plant] detected %s %.0f%% — confirming", label, top1_conf * 100)
 
-        if top1_conf < CONF_UPLOAD:
-            elapsed = now - first_detected
-            print(f"[plant] Confirming... {elapsed:.1f}s / {CONFIRM_SECS}s (conf {top1_conf:.0%})")
+        if top1_conf < CFG.conf_upload:
             continue
 
-        elapsed          = now - first_detected
-        label_last_saved = last_uploaded.get(label, 0.0)  # Fix #4: per-label cooldown
-
-        if elapsed >= CONFIRM_SECS and (now - label_last_saved) >= SAVE_COOLDOWN:
-            print(f"[plant] Confirmed {elapsed:.1f}s — uploading...")
-            threading.Thread(
-                target=upload_to_firebase,
-                args=("plant", label, top1_conf, frame, None),
-                daemon=True,
-            ).start()
+        elapsed = now - first_detected
+        cooled = now - last_uploaded.get(label, 0.0)
+        if elapsed >= CFG.confirm_secs and cooled >= CFG.save_cooldown:
+            log.info("[plant] confirmed %.1fs — queueing upload", elapsed)
+            enqueue_upload("plant", label, top1_conf, frame, None)
             last_uploaded[label] = now
-            first_detected       = None
-            first_label          = None
-        elif elapsed < CONFIRM_SECS:
-            print(f"[plant] Confirming... {elapsed:.1f}s / {CONFIRM_SECS}s")
-        else:
-            remaining = SAVE_COOLDOWN - (now - label_last_saved)
-            print(f"[plant] Confirmed but cooling down — {remaining:.0f}s remaining")
+            first_detected = first_label = None
+        elif elapsed >= CFG.confirm_secs:
+            log.debug("[plant] confirmed but cooling down — %.0fs left",
+                      CFG.save_cooldown - cooled)
 
 
 # ─────────────────────────────────────────────────────────────────
-# DRAW  — called by main on a fresh frame every cycle
+# WORKER SUPERVISOR — restart on crash instead of silent freeze
 # ─────────────────────────────────────────────────────────────────
-def _draw(frame):
-    with _fire_alock:
+def _supervise(name: str, target) -> None:
+    crashes = 0
+    while not STOP.is_set():
+        try:
+            target()
+            return                                   # clean exit (STOP set)
+        except Exception:
+            crashes += 1
+            log.exception("[%s] worker crashed (%d/%d)", name, crashes, CFG.worker_restart_max)
+            if crashes >= CFG.worker_restart_max:
+                log.error("[%s] too many crashes — giving up", name)
+                STOP.set()
+                return
+            time.sleep(1.0)
+
+
+# ─────────────────────────────────────────────────────────────────
+# DRAW
+# ─────────────────────────────────────────────────────────────────
+def _draw(frame: np.ndarray) -> None:
+    with _fire_lock:
         boxes = list(_fire_boxes)
-
     for x1, y1, x2, y2, label, conf in boxes:
         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 60, 255), 2)
-        cv2.putText(frame, f"{label} {conf:.2f}",
-                    (x1, max(y1 - 8, 12)),
+        cv2.putText(frame, f"{label} {conf:.2f}", (x1, max(y1 - 8, 12)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 60, 255), 2)
 
-    with _plant_alock:
+    with _plant_lock:
         plant = _plant_state[0]
-
     if plant is not None:
         label, conf, veg_bbox = plant
-
         if veg_bbox is not None:
             px1, py1, px2, py2 = veg_bbox
             cv2.rectangle(frame, (px1, py1), (px2, py2), (0, 200, 60), 2)
-
         clean = label.replace("___", " ").replace("_", " ")
-        text  = f"{clean}  {conf:.0%}"
+        text = f"{clean}  {conf:.0%}"
         (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.75, 2)
         cv2.rectangle(frame, (8, 8), (8 + tw + 10, 8 + th + 12), (0, 0, 0), -1)
         cv2.putText(frame, text, (13, 8 + th + 4),
@@ -362,58 +457,79 @@ def _draw(frame):
 # ─────────────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────────────
-def main():
-    global _raw_frame, _raw_frame_id
+def main() -> int:
+    for label, path in [("fire", CFG.model_fire), ("plant", CFG.model_plant)]:
+        if not Path(path).exists():
+            log.error("%s model not found: %s", label, path)
+            return 1
 
-    for name, path in [("Fire", MODEL_FIRE), ("Plant", MODEL_PLANT)]:
-        if not path.exists():
-            print(f"[ERROR] {name} model not found: {path}")
-            return
+    if CFG.gps_lat is None or CFG.gps_lng is None:
+        log.warning("GPS not set — set AGRO_GPS_LAT / AGRO_GPS_LNG for accurate uploads")
 
-    if GPS_LAT is None or GPS_LNG is None:
-        print("[WARNING] GPS coordinates not set — edit GPS_LAT / GPS_LNG in detect.py")
+    # Graceful shutdown on Ctrl+C / SIGTERM
+    signal.signal(signal.SIGINT, lambda *_: STOP.set())
+    signal.signal(signal.SIGTERM, lambda *_: STOP.set())
 
-    threading.Thread(target=_fire_worker,  daemon=True).start()
-    threading.Thread(target=_plant_worker, daemon=True).start()
+    threads = [
+        threading.Thread(target=_supervise, args=("fire", _fire_worker), name="fire"),
+        threading.Thread(target=_supervise, args=("plant", _plant_worker), name="plant"),
+    ]
+    uploaders = [
+        threading.Thread(target=_uploader_loop, name=f"uploader-{i}")
+        for i in range(CFG.upload_workers)
+    ]
+    for t in (*threads, *uploaders):
+        t.start()
 
-    cap = cv2.VideoCapture(0)
+    cap = cv2.VideoCapture(CFG.camera_index)
     if not cap.isOpened():
-        print("[ERROR] Cannot open camera.")
-        _stop.set()
-        _camera_ready.set()   # unblock workers so they see _stop and exit cleanly
-        return
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        log.error("cannot open camera %d", CFG.camera_index)
+        STOP.set()
+        BUS.ready.set()
+        _shutdown(threads, uploaders, cap=None)
+        return 1
+    if not cap.set(cv2.CAP_PROP_BUFFERSIZE, 1):
+        log.debug("camera backend ignored BUFFERSIZE=1 (expected on some platforms)")
 
-    # Fix #5: signal workers only after camera is confirmed open
-    _camera_ready.set()
+    BUS.ready.set()
+    log.info("AgroSentinel running — press Q to quit. fire model: %s", CFG.model_fire)
 
-    print("\nAgroSentinel running — press Q to quit.")
-    print(f"Fire model       : {MODEL_FIRE}")
-    print(f"Upload threshold : {CONF_UPLOAD:.0%}")
-    print(f"Confirm window   : {CONFIRM_SECS}s")
-    print(f"Save cooldown    : {SAVE_COOLDOWN}s\n")
+    try:
+        while not STOP.is_set():
+            ret, frame = cap.read()
+            if not ret:
+                log.error("camera read failed")
+                break
+            BUS.publish(frame.copy())
+            _draw(frame)
+            cv2.imshow("AgroSentinel", frame)
+            if cv2.waitKey(1) & 0xFF in (ord("q"), ord("Q")):
+                break
+    finally:
+        _shutdown(threads, uploaders, cap)
+    return 0
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            print("[ERROR] Camera read failed.")
-            break
 
-        with _raw_lock:
-            _raw_frame     = frame.copy()
-            _raw_frame_id += 1
-
-        _draw(frame)
-        cv2.imshow("AgroSentinel", frame)
-
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            break
-
-    _stop.set()
-    cap.release()
+def _shutdown(workers, uploaders, cap) -> None:
+    log.info("shutting down...")
+    STOP.set()
+    BUS.ready.set()
+    for t in workers:
+        t.join(timeout=5.0)
+    # Drain queued uploads, then stop uploaders
+    try:
+        _upload_q.join()
+    except Exception:
+        pass
+    for _ in uploaders:
+        _upload_q.put(None)
+    for t in uploaders:
+        t.join(timeout=10.0)
+    if cap is not None:
+        cap.release()
     cv2.destroyAllWindows()
-    print("Stopped.")
+    log.info("stopped.")
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

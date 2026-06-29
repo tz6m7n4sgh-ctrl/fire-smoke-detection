@@ -1,11 +1,18 @@
+from __future__ import annotations   # allow `dict | None` etc. on Python 3.9
+
 import torch
 import os
 import json
+import tempfile
 import yaml
+from pathlib import Path
 from ultralytics import YOLO
 from datetime import datetime
 
-DATASET         = "datasets/fire-8/data.yaml"
+# Resolve paths relative to this script, not the current working directory,
+# so train and detect agree on where training_runs/ lives regardless of cwd.
+SCRIPT_DIR      = Path(__file__).resolve().parent
+DATASET         = str(SCRIPT_DIR / "datasets" / "fire-8" / "data.yaml")
 
 # ── Model — set PRETRAINED_MODEL to a downloaded fire/smoke .pt to skip scratch training
 # Download from: https://universe.roboflow.com (search "fire smoke yolov8")
@@ -55,7 +62,7 @@ CLS             = 1.0
 DFL             = 1.5
 
 # ── Save & Output ──────────────────────────────────────────────
-PROJECT         = "training_runs"
+PROJECT         = str(SCRIPT_DIR / "training_runs")
 SAVE_PERIOD     = 10
 CONF            = 0.10                  # lower threshold catches faint/early smoke
 
@@ -64,6 +71,12 @@ CONF            = 0.10                  # lower threshold catches faint/early sm
 FORCE_RESTART   = False  # set True only to wipe checkpoints and retrain from scratch
 
 STATE_FILE      = os.path.join(PROJECT, "training_state.json")
+
+# Guard: Phase 1 needs stable (non-warmup) epochs or the frozen-head phase is pointless.
+assert FREEZE_EPOCHS > WARMUP_EPOCHS, (
+    f"FREEZE_EPOCHS ({FREEZE_EPOCHS}) must exceed WARMUP_EPOCHS ({WARMUP_EPOCHS}); "
+    f"otherwise Phase 1 is 100% warmup with no stable training."
+)
 
 
 # ╔══════════════════════════════════════════════════════════════╗
@@ -83,7 +96,12 @@ def detect_device():
 
     gpu_count = torch.cuda.device_count()
     name      = torch.cuda.get_device_name(0)
-    vram      = torch.cuda.get_device_properties(0).total_memory / 1e9
+    # Use the SMALLEST GPU's VRAM on heterogeneous multi-GPU rigs so the shared
+    # batch size never OOMs the weakest card.
+    vram      = min(
+        torch.cuda.get_device_properties(i).total_memory
+        for i in range(gpu_count)
+    ) / 1e9
 
     print(f"  GPUs found : {gpu_count}x {name}")
     print(f"  VRAM (each): {vram:.1f} GB")
@@ -175,15 +193,37 @@ def shared_args(device, batch, workers, amp):
 
 
 def save_state(state: dict):
+    """Atomic write: dump to a temp file in the same dir, then os.replace().
+
+    Prevents a half-written training_state.json if the process is killed
+    mid-save (OOM / power loss), which would otherwise crash the next run.
+    """
     os.makedirs(PROJECT, exist_ok=True)
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
+    fd, tmp = tempfile.mkstemp(dir=PROJECT, prefix=".state-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(state, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, STATE_FILE)   # atomic on POSIX/NTFS
+    except Exception:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
 
 def load_state() -> dict | None:
-    if os.path.exists(STATE_FILE):
+    if not os.path.exists(STATE_FILE):
+        return None
+    try:
         with open(STATE_FILE) as f:
             return json.load(f)
-    return None
+    except (json.JSONDecodeError, OSError) as exc:
+        print(f"  ⚠️  Corrupt/unreadable state file ({exc}) — starting fresh.")
+        try:
+            os.remove(STATE_FILE)
+        except OSError:
+            pass
+        return None
 
 def detect_resume_state():
     if FORCE_RESTART:
@@ -243,7 +283,9 @@ def validate(model, output_dir):
     if os.path.exists(best):
         model = YOLO(best)
 
-    metrics = model.val(conf=CONF, augment=True, iou=0.4)  # TTA + lower IoU keeps overlapping fire+smoke separate
+    # Pass data= explicitly: a reloaded best.pt validates against the path baked
+    # into its weights otherwise, which may be stale or wrong.
+    metrics = model.val(data=DATASET, conf=CONF, augment=True, iou=0.4)  # TTA + lower IoU separates overlapping fire+smoke
     map50   = metrics.box.map50
     map5095 = metrics.box.map
     prec    = metrics.box.mp or 0.0
@@ -398,6 +440,12 @@ def main():
         model          = None
         phase1_dir     = rs["phase1_dir"]   # ensure phase1_dir is always set from state
         p1_best_for_p2 = rs["phase1_best"]
+        # Guard: old/partial state files may lack phase1_best — fail clearly
+        # instead of crashing later on os.path.exists(None).
+        if not p1_best_for_p2:
+            print("  ❌ ERROR: state file has no Phase 1 weights path "
+                  "(corrupt or pre-upgrade state). Set FORCE_RESTART=True to retrain.")
+            raise SystemExit(1)
 
     
     print("\n" + "─" * 60)
@@ -465,11 +513,11 @@ def main():
     print(f"   └── confusion_matrix.png  ← per-class accuracy")
 
     # ── Export to ONNX for edge/CPU deployment ─────────────────
+    onnx_path = str(Path(best_final).with_suffix(".onnx"))
     print(f"\n  Exporting best model to ONNX...")
     try:
         export_model = YOLO(best_final)
         export_model.export(format="onnx", imgsz=IMG_SIZE, dynamic=True)
-        onnx_path = best_final.replace(".pt", ".onnx")
         print(f"  ✅ ONNX model saved: {onnx_path}")
         print(f"     Use for edge cameras, Jetson, or CPU-only deployments.")
     except Exception as e:
@@ -478,7 +526,7 @@ def main():
     print(f"\n  Inference command (PyTorch):")
     print(f'   yolo detect predict model="{os.path.abspath(best_final)}" source=your_image.jpg conf=0.10 iou=0.4')
     print(f"\n  Inference command (ONNX):")
-    print(f'   yolo detect predict model="{os.path.abspath(best_final).replace(".pt", ".onnx")}" source=your_image.jpg conf=0.10 iou=0.4')
+    print(f'   yolo detect predict model="{os.path.abspath(onnx_path)}" source=your_image.jpg conf=0.10 iou=0.4')
 
 
 if __name__ == '__main__':
