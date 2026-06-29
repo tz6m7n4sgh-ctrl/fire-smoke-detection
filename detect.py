@@ -21,6 +21,7 @@ import time
 import queue
 import signal
 import logging
+import functools
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -130,7 +131,25 @@ class Config:
     upload_workers: int = 2
     worker_restart_max: int = 5        # give up after N crashes per worker
 
+    upload_drain_secs: float = 8.0     # best-effort drain window on shutdown
+
     fire_ignore: frozenset[str] = frozenset({"default"})
+
+    def __post_init__(self) -> None:
+        # Validate env-driven numbers so a typo'd AGRO_* var fails loudly,
+        # not silently (e.g. conf=-1 uploads everything, conf=5 uploads nothing).
+        for name in ("conf_upload", "fire_conf_display", "plant_conf_display"):
+            v = getattr(self, name)
+            if not 0.0 <= v <= 1.0:
+                clamped = min(1.0, max(0.0, v))
+                log.warning("%s=%s out of [0,1] — clamping to %s", name, v, clamped)
+                setattr(self, name, clamped)
+        for name in ("confirm_secs", "save_cooldown"):
+            if getattr(self, name) < 0:
+                log.warning("%s < 0 — forcing 0", name)
+                setattr(self, name, 0.0)
+        if self.fire_imgsz % 32 or self.plant_imgsz % 32:
+            log.warning("imgsz should be a multiple of 32 — YOLO will round silently")
 
     def gps(self) -> tuple[float, float]:
         if self.gps_lat is None or self.gps_lng is None:
@@ -232,17 +251,14 @@ def enqueue_upload(model_name: str, label: str, conf: float,
 # ─────────────────────────────────────────────────────────────────
 # FIRE WORKER
 # ─────────────────────────────────────────────────────────────────
-def _fire_worker() -> None:
-    log.info("[fire] loading model %s", CFG.model_fire)
-    model = YOLO(str(CFG.model_fire))
-    log.info("[fire] ready. classes: %s", list(model.names.values()))
-
+def _fire_worker(model, last_uploaded: dict) -> None:
+    # model + last_uploaded are owned by main() and passed in, so a supervisor
+    # restart neither reloads the model (no GPU leak) nor loses cooldown state.
     BUS.ready.wait()
 
     last_seen_id = -1
     first_detected: Optional[float] = None
     first_label: Optional[str] = None
-    last_uploaded: dict[str, float] = {}
     missed_frames = 0
     last_best_box = None
 
@@ -319,10 +335,14 @@ def _fire_worker() -> None:
         elapsed = now - first_detected
         cooled = now - last_uploaded.get(best_label, 0.0)
         if elapsed >= CFG.confirm_secs and cooled >= CFG.save_cooldown:
-            log.info("[fire] confirmed %.1fs — queueing upload", elapsed)
-            enqueue_upload("fire", best_label, best_conf, frame, bbox)
-            last_uploaded[best_label] = now
-            first_detected = first_label = None
+            # Only start the cooldown / reset the timer if the event was actually
+            # queued. A dropped (queue-full) fire must NOT be suppressed for 30s.
+            if enqueue_upload("fire", best_label, best_conf, frame, bbox):
+                log.info("[fire] confirmed %.1fs — queued upload", elapsed)
+                last_uploaded[best_label] = now
+                first_detected = first_label = None
+            else:
+                log.warning("[fire] upload dropped (queue full) — will retry")
         elif elapsed >= CFG.confirm_secs:
             log.debug("[fire] confirmed but cooling down — %.0fs left",
                       CFG.save_cooldown - cooled)
@@ -331,17 +351,13 @@ def _fire_worker() -> None:
 # ─────────────────────────────────────────────────────────────────
 # PLANT WORKER
 # ─────────────────────────────────────────────────────────────────
-def _plant_worker() -> None:
-    log.info("[plant] loading model %s", CFG.model_plant)
-    model = YOLO(str(CFG.model_plant))
-    log.info("[plant] ready. classes: %s", list(model.names.values()))
-
+def _plant_worker(model, last_uploaded: dict) -> None:
+    # model + last_uploaded owned by main() — survives supervisor restart.
     BUS.ready.wait()
 
     last_seen_id = -1
     first_detected: Optional[float] = None
     first_label: Optional[str] = None
-    last_uploaded: dict[str, float] = {}
 
     while not STOP.is_set():
         fid, frame = BUS.latest()
@@ -400,10 +416,12 @@ def _plant_worker() -> None:
         elapsed = now - first_detected
         cooled = now - last_uploaded.get(label, 0.0)
         if elapsed >= CFG.confirm_secs and cooled >= CFG.save_cooldown:
-            log.info("[plant] confirmed %.1fs — queueing upload", elapsed)
-            enqueue_upload("plant", label, top1_conf, frame, None)
-            last_uploaded[label] = now
-            first_detected = first_label = None
+            if enqueue_upload("plant", label, top1_conf, frame, None):
+                log.info("[plant] confirmed %.1fs — queued upload", elapsed)
+                last_uploaded[label] = now
+                first_detected = first_label = None
+            else:
+                log.warning("[plant] upload dropped (queue full) — will retry")
         elif elapsed >= CFG.confirm_secs:
             log.debug("[plant] confirmed but cooling down — %.0fs left",
                       CFG.save_cooldown - cooled)
@@ -425,7 +443,8 @@ def _supervise(name: str, target) -> None:
                 log.error("[%s] too many crashes — giving up", name)
                 STOP.set()
                 return
-            time.sleep(1.0)
+            if STOP.wait(1.0):   # exit promptly if shutdown started during backoff
+                return
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -466,19 +485,44 @@ def main() -> int:
     if CFG.gps_lat is None or CFG.gps_lng is None:
         log.warning("GPS not set — set AGRO_GPS_LAT / AGRO_GPS_LNG for accurate uploads")
 
-    # Graceful shutdown on Ctrl+C / SIGTERM
-    signal.signal(signal.SIGINT, lambda *_: STOP.set())
-    signal.signal(signal.SIGTERM, lambda *_: STOP.set())
+    # Load models ONCE here so a supervisor restart reuses them (no GPU reload).
+    try:
+        log.info("loading fire model %s", CFG.model_fire)
+        fire_model = YOLO(str(CFG.model_fire))
+        log.info("fire classes: %s", list(fire_model.names.values()))
+        log.info("loading plant model %s", CFG.model_plant)
+        plant_model = YOLO(str(CFG.model_plant))
+        log.info("plant classes: %s", list(plant_model.names.values()))
+    except Exception:
+        log.exception("model load failed")
+        return 1
 
-    threads = [
-        threading.Thread(target=_supervise, args=("fire", _fire_worker), name="fire"),
-        threading.Thread(target=_supervise, args=("plant", _plant_worker), name="plant"),
+    # Cooldown state owned here so it survives a worker restart.
+    fire_cooldown: dict[str, float] = {}
+    plant_cooldown: dict[str, float] = {}
+
+    # Graceful shutdown on Ctrl+C / SIGTERM (main thread only — valid here).
+    signal.signal(signal.SIGINT, lambda *_: STOP.set())
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, lambda *_: STOP.set())
+
+    workers = [
+        threading.Thread(
+            target=_supervise,
+            args=("fire", functools.partial(_fire_worker, fire_model, fire_cooldown)),
+            name="fire"),
+        threading.Thread(
+            target=_supervise,
+            args=("plant", functools.partial(_plant_worker, plant_model, plant_cooldown)),
+            name="plant"),
     ]
+    # Uploaders are daemon: a single hung network upload must never block process
+    # exit. We drain best-effort with a timeout below, then let daemons die.
     uploaders = [
-        threading.Thread(target=_uploader_loop, name=f"uploader-{i}")
+        threading.Thread(target=_uploader_loop, name=f"uploader-{i}", daemon=True)
         for i in range(CFG.upload_workers)
     ]
-    for t in (*threads, *uploaders):
+    for t in (*workers, *uploaders):
         t.start()
 
     cap = cv2.VideoCapture(CFG.camera_index)
@@ -486,7 +530,7 @@ def main() -> int:
         log.error("cannot open camera %d", CFG.camera_index)
         STOP.set()
         BUS.ready.set()
-        _shutdown(threads, uploaders, cap=None)
+        _shutdown(workers, cap=None)
         return 1
     if not cap.set(cv2.CAP_PROP_BUFFERSIZE, 1):
         log.debug("camera backend ignored BUFFERSIZE=1 (expected on some platforms)")
@@ -496,6 +540,9 @@ def main() -> int:
 
     try:
         while not STOP.is_set():
+            # NOTE: cap.read() is a blocking C call. On a camera hang (USB unplug)
+            # it may not return promptly, delaying SIGTERM-triggered shutdown until
+            # it does. This is an OpenCV limitation; a watchdog could force-release.
             ret, frame = cap.read()
             if not ret:
                 log.error("camera read failed")
@@ -506,25 +553,31 @@ def main() -> int:
             if cv2.waitKey(1) & 0xFF in (ord("q"), ord("Q")):
                 break
     finally:
-        _shutdown(threads, uploaders, cap)
+        _shutdown(workers, cap)
     return 0
 
 
-def _shutdown(workers, uploaders, cap) -> None:
+def _shutdown(workers, cap) -> None:
     log.info("shutting down...")
     STOP.set()
     BUS.ready.set()
     for t in workers:
         t.join(timeout=5.0)
-    # Drain queued uploads, then stop uploaders
-    try:
-        _upload_q.join()
-    except Exception:
-        pass
-    for _ in uploaders:
-        _upload_q.put(None)
-    for t in uploaders:
-        t.join(timeout=10.0)
+
+    # Best-effort drain: wait up to upload_drain_secs for queued uploads to flush,
+    # then send poison pills. Daemon uploaders mean a stuck upload can't hang exit.
+    deadline = time.time() + CFG.upload_drain_secs
+    while not _upload_q.empty() and time.time() < deadline:
+        time.sleep(0.1)
+    remaining = _upload_q.qsize()
+    if remaining:
+        log.warning("%d upload(s) not flushed before shutdown deadline", remaining)
+    for _ in range(CFG.upload_workers):
+        try:
+            _upload_q.put_nowait(None)
+        except queue.Full:
+            pass
+
     if cap is not None:
         cap.release()
     cv2.destroyAllWindows()

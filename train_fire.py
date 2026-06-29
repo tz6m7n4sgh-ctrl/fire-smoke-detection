@@ -72,11 +72,13 @@ FORCE_RESTART   = False  # set True only to wipe checkpoints and retrain from sc
 
 STATE_FILE      = os.path.join(PROJECT, "training_state.json")
 
-# Guard: Phase 1 needs stable (non-warmup) epochs or the frozen-head phase is pointless.
-assert FREEZE_EPOCHS > WARMUP_EPOCHS, (
-    f"FREEZE_EPOCHS ({FREEZE_EPOCHS}) must exceed WARMUP_EPOCHS ({WARMUP_EPOCHS}); "
-    f"otherwise Phase 1 is 100% warmup with no stable training."
-)
+# Guard: Phase 1 needs stable (non-warmup) epochs or the frozen-head phase is
+# pointless. Use raise (not assert) so it survives `python -O`, which strips asserts.
+if FREEZE_EPOCHS <= WARMUP_EPOCHS:
+    raise SystemExit(
+        f"FREEZE_EPOCHS ({FREEZE_EPOCHS}) must exceed WARMUP_EPOCHS ({WARMUP_EPOCHS}); "
+        f"otherwise Phase 1 is 100% warmup with no stable training."
+    )
 
 
 # ╔══════════════════════════════════════════════════════════════╗
@@ -468,6 +470,10 @@ def main():
     phase2_name = run_name + "_phase2"
 
     if mode == "resume_phase2":
+        if not os.path.exists(rs["p2_last"]):   # re-verify: file may vanish post state-check
+            print(f"  ❌ ERROR: Phase 2 checkpoint missing: {rs['p2_last']}")
+            print(f"  Set FORCE_RESTART=True to retrain from scratch.")
+            raise SystemExit(1)
         model2 = YOLO(rs["p2_last"])
         model2.train(
             **shared_args(device, batch, workers, amp),
