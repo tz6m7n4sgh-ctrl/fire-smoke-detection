@@ -1,4 +1,7 @@
-path: C:\Users\Dina\Desktop\FASDD_CV_Fire_Smoke_Detection.v4-fasdd_cv_640_v2.yolov8
+# `path` is the dataset root. Keep it portable: '.' resolves relative to this
+# file's location, so the dataset works on any machine. Override per-machine by
+# setting an absolute path or a $DATASET_ROOT env var if your images live elsewhere.
+path: .
 
 train: train/images
 val: valid/images
