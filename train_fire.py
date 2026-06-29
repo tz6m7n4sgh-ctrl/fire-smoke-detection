@@ -149,6 +149,88 @@ def auto_batch(vram_gb, gpu_count):
     return total_batch
 
 
+# Ultralytics' supported image suffixes (keep in sync with ultralytics.data.utils.IMG_FORMATS)
+IMG_EXTS = {".bmp", ".dng", ".jpeg", ".jpg", ".mpo", ".png",
+            ".tif", ".tiff", ".webp", ".pfm", ".heic"}
+
+
+def count_train_images(dataset_yaml):
+    """Count training images so we can keep the final batch from being size 1.
+
+    Resolves the dataset's `train` entry the same way Ultralytics does:
+    relative to the yaml's `path` root (or the yaml's own dir if `path` is unset).
+    `train` may be a directory, a list of directories, or a .txt list-of-paths.
+
+    Returns None if the count can't be determined — the caller then only
+    enforces the batch >= 2 floor and skips the last-batch check.
+    """
+    try:
+        with open(dataset_yaml) as f:
+            d = yaml.safe_load(f)
+    except (OSError, yaml.YAMLError):
+        return None
+
+    yaml_dir = Path(dataset_yaml).resolve().parent
+    root = Path(d.get("path") or yaml_dir)
+    if not root.is_absolute():
+        root = yaml_dir / root
+
+    train = d.get("train")
+    entries = train if isinstance(train, (list, tuple)) else [train]
+
+    total = 0
+    for entry in entries:
+        if not entry:
+            continue
+        p = Path(entry)
+        if not p.is_absolute():
+            p = root / p
+        if p.is_dir():
+            total += sum(1 for f in p.rglob("*") if f.suffix.lower() in IMG_EXTS)
+        elif p.is_file():           # .txt manifest: one image path per line
+            try:
+                with open(p) as fh:
+                    total += sum(1 for line in fh if line.strip())
+            except OSError:
+                pass
+    return total or None
+
+
+def safe_batch(batch, dataset_yaml):
+    """Prevent the BatchNorm crash 'Expected more than 1 value per channel'.
+
+    BatchNorm needs >1 sample per step, so two cases break training:
+      • batch == 1            → every step is a size-1 batch
+      • n_train % batch == 1  → the final batch of each epoch is size 1
+    Ultralytics doesn't expose `drop_last`, so we adjust the batch instead:
+    shrink toward a floor of 2 (memory-safe), and only grow if an odd image
+    count still leaves a size-1 tail at the floor.
+    """
+    if batch < 2:
+        print(f"  ⚠️  Batch size {batch} too small for BatchNorm — raising to 2.")
+        batch = 2
+
+    n = count_train_images(dataset_yaml)
+    if not n:
+        print("  ⚠️  Could not count training images — enforcing batch >= 2 only.")
+        return batch
+    if n < 2:
+        print(f"  ⚠️  Only {n} training image(s) found — BatchNorm needs >= 2. "
+              f"Add more data or training will crash.")
+        return batch
+
+    original = batch
+    batch = min(batch, n)                 # batch larger than the dataset → one full batch
+    while batch > 2 and n % batch == 1:   # prefer shrinking (won't increase memory)
+        batch -= 1
+    while n % batch == 1 and batch < n:   # odd-count fallback: grow until the tail is >= 2
+        batch += 1
+
+    if batch != original:
+        print(f"  ⚠️  Adjusted batch {original} → {batch} so the last batch isn't size 1 "
+              f"({n} train images, last batch = {n % batch or batch}).")
+    return batch
+
 
 def shared_args(device, batch, workers, amp):
     return dict(
@@ -325,6 +407,7 @@ def main():
     # ── Detect GPU ────────────────────────────────────────────
     device, vram, workers, amp, gpu_count = detect_device()
     batch = auto_batch(vram, gpu_count)
+    batch = safe_batch(batch, DATASET)   # avoid size-1 final batch → BatchNorm crash
     os.makedirs(PROJECT, exist_ok=True)
 
     rs = detect_resume_state()
