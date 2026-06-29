@@ -1,0 +1,26 @@
+# Training outputs
+training_runs/
+runs/
+*.pt
+*.onnx
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+venv/
+*.egg-info/
+dist/
+build/
+
+# Dataset (large — store separately)
+datasets/
+*.zip
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/

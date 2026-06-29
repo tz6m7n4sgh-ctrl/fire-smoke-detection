@@ -1,0 +1,8 @@
+path: C:\Users\Dina\Desktop\FASDD_CV_Fire_Smoke_Detection.v4-fasdd_cv_640_v2.yolov8
+
+train: train/images
+val: valid/images
+test: test/images
+
+nc: 2
+names: ['fire', 'smoke']
