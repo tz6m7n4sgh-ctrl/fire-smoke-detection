@@ -14,7 +14,8 @@ PRETRAINED_MODEL = None                 # e.g. "/path/to/fire_smoke_best.pt"
 MODEL            = PRETRAINED_MODEL if PRETRAINED_MODEL else "yolov8m.pt"
 
 # Fewer epochs needed when starting from a fire/smoke pretrained model
-FREEZE_EPOCHS   = 5  if PRETRAINED_MODEL else 15
+# FREEZE_EPOCHS must be > WARMUP_EPOCHS (5) or Phase 1 is 100% warmup with no stable training
+FREEZE_EPOCHS   = 10 if PRETRAINED_MODEL else 15
 FREEZE_LAYERS   = 10
 FINETUNE_EPOCHS = 100 if PRETRAINED_MODEL else 300  # pretrained converges much faster
 
@@ -60,7 +61,7 @@ CONF            = 0.10                  # lower threshold catches faint/early sm
 
 # ── Resume control ─────────────────────────────────────────────
 # Set FORCE_RESTART = True to ignore saved state and train from scratch
-FORCE_RESTART   = True
+FORCE_RESTART   = False  # set True only to wipe checkpoints and retrain from scratch
 
 STATE_FILE      = os.path.join(PROJECT, "training_state.json")
 
