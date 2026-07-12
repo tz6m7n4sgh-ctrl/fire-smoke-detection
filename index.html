@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Fire &amp; Smoke Detection</title>
+  <meta name="description" content="A YOLOv8-based pipeline for real-time fire and smoke detection, built for edge deployment." />
+  <style>
+    :root {
+      --bg: #0d1117;
+      --bg-soft: #161b22;
+      --border: #21262d;
+      --text: #e6edf3;
+      --muted: #9198a1;
+      --accent: #ff6b35;
+      --accent-2: #f7931e;
+      --smoke: #6e7681;
+    }
+    @media (prefers-color-scheme: light) {
+      :root {
+        --bg: #ffffff;
+        --bg-soft: #f6f8fa;
+        --border: #d0d7de;
+        --text: #1f2328;
+        --muted: #59636e;
+        --accent: #e8590c;
+        --accent-2: #d9480f;
+        --smoke: #848d97;
+      }
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+    }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .wrap { max-width: 960px; margin: 0 auto; padding: 0 24px; }
+
+    /* Hero */
+    header {
+      background:
+        radial-gradient(1200px 400px at 50% -100px, rgba(255,107,53,0.18), transparent),
+        var(--bg);
+      border-bottom: 1px solid var(--border);
+      padding: 80px 0 64px;
+      text-align: center;
+    }
+    .flame { font-size: 64px; line-height: 1; filter: drop-shadow(0 4px 16px rgba(255,107,53,0.4)); }
+    h1 {
+      font-size: clamp(2rem, 6vw, 3.25rem);
+      font-weight: 800;
+      letter-spacing: -0.02em;
+      margin: 16px 0 8px;
+      background: linear-gradient(135deg, var(--accent), var(--accent-2));
+      -webkit-background-clip: text;
+      background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+    .tagline { color: var(--muted); font-size: clamp(1rem, 2.5vw, 1.25rem); max-width: 640px; margin: 0 auto; }
+    .badges { margin-top: 24px; display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; }
+    .badge {
+      font-size: 0.8rem; color: var(--muted);
+      background: var(--bg-soft); border: 1px solid var(--border);
+      border-radius: 999px; padding: 4px 12px;
+    }
+    .cta { margin-top: 32px; display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
+    .btn {
+      display: inline-block; padding: 12px 24px; border-radius: 8px; font-weight: 600;
+      border: 1px solid var(--border);
+    }
+    .btn-primary { background: linear-gradient(135deg, var(--accent), var(--accent-2)); color: #fff; border: none; }
+    .btn-primary:hover { text-decoration: none; opacity: 0.92; }
+    .btn-ghost { background: var(--bg-soft); color: var(--text); }
+    .btn-ghost:hover { text-decoration: none; border-color: var(--accent); }
+
+    /* Sections */
+    section { padding: 56px 0; border-bottom: 1px solid var(--border); }
+    h2 { font-size: 1.5rem; font-weight: 700; margin-bottom: 24px; letter-spacing: -0.01em; }
+
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; }
+    .card {
+      background: var(--bg-soft); border: 1px solid var(--border);
+      border-radius: 12px; padding: 20px;
+    }
+    .card .ico { font-size: 24px; }
+    .card h3 { font-size: 1.05rem; margin: 10px 0 6px; }
+    .card p { color: var(--muted); font-size: 0.925rem; }
+
+    pre {
+      background: var(--bg-soft); border: 1px solid var(--border);
+      border-radius: 10px; padding: 16px 18px; overflow-x: auto;
+      font-size: 0.9rem; font-family: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+    }
+    pre code { color: var(--text); }
+    .comment { color: var(--smoke); }
+
+    table { width: 100%; border-collapse: collapse; font-size: 0.9rem; display: block; overflow-x: auto; }
+    th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+    th { color: var(--muted); font-weight: 600; }
+    td code { background: var(--bg-soft); padding: 2px 6px; border-radius: 5px; font-size: 0.85em; }
+
+    footer { padding: 40px 0; text-align: center; color: var(--muted); font-size: 0.875rem; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="wrap">
+      <div class="flame">🔥</div>
+      <h1>Fire &amp; Smoke Detection</h1>
+      <p class="tagline">A YOLOv8-based pipeline for training and running real-time fire and smoke detection models — built for edge deployment.</p>
+      <div class="badges">
+        <span class="badge">YOLOv8</span>
+        <span class="badge">PyTorch</span>
+        <span class="badge">Python 3.9+</span>
+        <span class="badge">MIT License</span>
+      </div>
+      <div class="cta">
+        <a class="btn btn-primary" href="https://github.com/tz6m7n4sgh-ctrl/fire-smoke-detection">View on GitHub</a>
+        <a class="btn btn-ghost" href="#quickstart">Quickstart</a>
+      </div>
+    </div>
+  </header>
+
+  <section>
+    <div class="wrap">
+      <h2>Features</h2>
+      <div class="grid">
+        <div class="card">
+          <div class="ico">🧊</div>
+          <h3>Two-phase transfer learning</h3>
+          <p>A frozen-backbone warmup phase followed by a full fine-tune, with resume-from-checkpoint support.</p>
+        </div>
+        <div class="card">
+          <div class="ico">⚙️</div>
+          <h3>Hardware-aware training</h3>
+          <p>Device, batch size, dataloader workers, and mixed precision are auto-detected from the installed GPU(s).</p>
+        </div>
+        <div class="card">
+          <div class="ico">🔍</div>
+          <h3>High small-object recall</h3>
+          <p>1280px input, aggressive augmentation, and a low confidence threshold tuned to catch faint or distant smoke.</p>
+        </div>
+        <div class="card">
+          <div class="ico">🛰️</div>
+          <h3>Production inference</h3>
+          <p>Supervised background workers, a bounded upload queue, worker restart, and graceful drain-on-shutdown.</p>
+        </div>
+        <div class="card">
+          <div class="ico">🎛️</div>
+          <h3>Fully env-configurable</h3>
+          <p>Inference behavior is overridable via <code>AGRO_*</code> environment variables — same binary in dev and on-device.</p>
+        </div>
+        <div class="card">
+          <div class="ico">📦</div>
+          <h3>Two classes</h3>
+          <p>Detects <strong>fire</strong> and <strong>smoke</strong> in standard YOLO-format datasets.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="quickstart">
+    <div class="wrap">
+      <h2>Quickstart</h2>
+      <pre><code><span class="comment"># 1. Install dependencies</span>
+pip install -r requirements.txt
+
+<span class="comment"># 2. Place your dataset under datasets/fire-8/ (YOLO format)</span>
+<span class="comment">#    train/ valid/ test/ with images + labels</span>
+
+<span class="comment"># 3. Train (auto-tunes to your GPU, two-phase)</span>
+python train_fire.py
+
+<span class="comment"># 4. Run real-time inference</span>
+python detect.py</code></pre>
+    </div>
+  </section>
+
+  <section>
+    <div class="wrap">
+      <h2>Inference configuration</h2>
+      <p style="color:var(--muted); margin-bottom:20px;">Override behavior at runtime with environment variables:</p>
+      <table>
+        <thead>
+          <tr><th>Variable</th><th>Default</th><th>Description</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>AGRO_CAMERA</code></td><td><code>0</code></td><td>Camera index</td></tr>
+          <tr><td><code>AGRO_FIRE_CONF</code></td><td><code>0.35</code></td><td>Display confidence threshold</td></tr>
+          <tr><td><code>AGRO_CONF_UPLOAD</code></td><td><code>0.80</code></td><td>Confidence required to upload an event</td></tr>
+          <tr><td><code>AGRO_FIRE_IMGSZ</code></td><td><code>1280</code></td><td>Inference image size</td></tr>
+          <tr><td><code>AGRO_GPS_LAT / LNG</code></td><td><code>unset</code></td><td>GPS coordinates attached to uploads</td></tr>
+          <tr><td><code>AGRO_LOG_LEVEL</code></td><td><code>INFO</code></td><td>Logging verbosity</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <footer>
+    <div class="wrap">
+      <p>Released under the MIT License · <a href="https://github.com/tz6m7n4sgh-ctrl/fire-smoke-detection">github.com/tz6m7n4sgh-ctrl/fire-smoke-detection</a></p>
+    </div>
+  </footer>
+</body>
+</html>
